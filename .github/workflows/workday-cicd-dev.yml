@@ -1,0 +1,529 @@
+name: workday-cicd-dev
+
+on:
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - 'workday/**'
+      - '.github/workflows/workday-cicd-dev.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.10" # Based on standard Databricks runtime
+  DATABRICKS_TARGET: unit_dev
+  
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Validate PR — branch, title, and commit conventions (develop)
+  # Acceptance criteria: Source branch, PR title, and commit messages match allowed patterns for merge into develop
+  # -------------------------------------------------------------------------
+  validate_pr:
+    name: Validate PR Rules (develop)
+    runs-on: 
+      - ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR Source Branch
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          TARGET_BRANCH: ${{ github.base_ref }}
+        run: |
+          echo "____________________________________________________"
+          echo "🔍 Validating PR source branch"
+          echo "   Source : $SOURCE_BRANCH"
+          echo "   Target : $TARGET_BRANCH"
+          echo "____________________________________________________"
+          if [ "$TARGET_BRANCH" = "develop" ]; then
+            echo "📋 Rule: source must be 'stage' OR match (feature|feat|major|fix|refactor|docs|chore)/NDP-[0-9]+"
+            if [[ "$SOURCE_BRANCH" =~ "stage" ]]; then
+              echo "✅ Source is 'stage' - sync PR path, allowed"
+            elif [[ "$SOURCE_BRANCH" =~ ^chore/sync-stage-to-develop- ]]; then
+              echo "✅ Source is a stage-develop sync branch - allowed"
+            elif [[ "$SOURCE_BRANCH" =~ ^(feature|feat|major|fix|refactor|docs|chore)/NDP-[0-9]+(-[a-zA-Z0-9-]+)*$ ]]; then
+              echo "✅ Source matches feature branch pattern"
+            else
+              echo "❌ '$SOURCE_BRANCH' does not match any allowed pattern"
+              echo -e "❌ ERROR: Branch name format is invalid.\nCurrent: $SOURCE_BRANCH\nAllowed: feature/NDP-XXXX"
+              exit 1
+            fi
+          fi
+          echo "✅ PR source branch validation passed"
+
+      - name: Validate PR Title Format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          SOURCE_BRANCH: ${{ github.head_ref }}
+        run: |
+          echo "____________________________________________________"
+          echo "🔍 Validating PR title format"
+          echo "   Source : $SOURCE_BRANCH"
+          echo "   Title  : $PR_TITLE"
+          echo "____________________________________________________"
+          if [[ "$SOURCE_BRANCH" =~ ^chore/sync-stage-to-develop- ]]; then
+            echo "📋 Automated stage->develop sync PR - title validation skipped"
+          elif [[ "$SOURCE_BRANCH" == "stage" ]]; then
+            echo "📋 Path: stage -> develop (sync PR)"
+            if [[ "$PR_TITLE" =~ ^chore:\ (auto-)?sync\ main\ into\ stage ]]; then
+              echo "✅ Cascading auto-sync PR title accepted."
+            else
+              echo "📋 Rule: title must match pre-release/NDP-<number>-<YYYY-MM-DD>[: optional description]"
+              if [[ ! "$PR_TITLE" =~ ^pre-release/NDP-[0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}(:\ .*)?$ ]]; then
+                echo "❌ '$PR_TITLE' does not match required format"
+                echo "❌ ERROR: PR title must be in the format pre-release/NDP-<number>-<YYYY-MM-DD>." > .github_error_msg
+                exit 1
+              fi
+            fi
+          else
+            echo "📋 Path: feature branch -> develop"
+            echo "📋 Rule: title must match (feat|feature|fix|major|docs|refactor|chore)(NDP-<number>): <description>"
+            if [[ ! "$PR_TITLE" =~ ^(feat|feature|fix|major|docs|refactor|chore)\(NDP-[0-9]+\):\ .+$ ]]; then
+              echo "❌ '$PR_TITLE' does not match conventional commits format"
+              echo "❌ ERROR: PR title must follow conventional commits (e.g., feat(NDP-123): description)." > .github_error_msg
+              exit 1
+            fi
+          fi
+          echo "✅ PR title validation passed."
+
+      - name: Verify Commit Message Format
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          echo "____________________________________________________"
+          echo "🔍 Verifying commit message format"
+          echo "   Source : $SOURCE_BRANCH"
+          echo "   Range  : origin/$BASE_REF..origin/$HEAD_REF"
+          echo "____________________________________________________"
+          if [[ "$SOURCE_BRANCH" == "stage" || "$SOURCE_BRANCH" =~ ^chore/sync-stage-to-develop- ]]; then
+            echo "📋 Skipping commit message check - automated sync PR"
+          else
+            echo "📋 Rule: Each commit must match (feat|feature|fix|major|docs|refactor|chore)(NDP-<number>): <description>"
+            echo "📋 Rule: or match release/NDP-<number>-<YYYY-MM-DD>[: optional description]"
+            git fetch --all
+            COMMIT_MESSAGES=$(git log origin/$BASE_REF..origin/$HEAD_REF --pretty=%s)
+            echo ""
+            echo "📋 Commits to validate:"
+            while IFS= read -r line; do
+              [[ -n "$line" ]] && echo "  - $line"
+            done <<< "$COMMIT_MESSAGES"
+            echo ""
+            INVALID_MSGS=""
+            while IFS= read -r line; do
+              if [[ -n "$line" && ! "$line" =~ ^(feat|feature|fix|major|docs|refactor|chore)\(NDP-[0-9]+\):\ .+$ ]]; then
+                echo "  ❌ INVALID: $line"
+                INVALID_MSGS+="$line\n"
+              else
+                echo "  ✅ valid   : $line"
+              fi
+            done <<< "$COMMIT_MESSAGES"
+            if [[ -n "$INVALID_MSGS" ]]; then
+              echo ""
+              echo -e "❌ ERROR: Commits must follow format 'feat(NDP-XXXX): description':\n$INVALID_MSGS" > .github_error_msg
+              exit 1
+            fi
+            echo ""
+            echo "✅ All commit messages format validation passed"
+          fi
+
+      - name: Send SNS notification on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.DEV_SNS_TOPIC_ARN }}
+          GH_WORKFLOW: ${{ github.workflow }}
+          GH_JOB: ${{ github.job }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_HEAD_REF: ${{ github.head_ref }}
+          GH_BASE_REF: ${{ github.base_ref }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          ERROR_MSG=$(cat .github_error_msg 2>/dev/null || echo "Unknown error. See workflow logs for details.")
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "❌ Develop Branch Protection Failed - PR Validation" \
+            --message "Workflow: $GH_WORKFLOW
+          $ERROR_MSG
+          Job: $GH_JOB
+          Branch: $GH_REF_NAME
+          PR Source: $GH_HEAD_REF
+          PR Target: $GH_BASE_REF
+          Triggered by: $GH_ACTOR
+          View run: $GH_SERVER_URL/$GH_REPOSITORY/actions/runs/$GH_RUN_ID" || echo "Failed to send SNS notification"
+
+  # -------------------------------------------------------------------------
+  # 2. Lint — pylint (Python), nbqa (notebooks), sqlfluff (SQL)
+  # Acceptance criteria: Pylint score meets threshold; SQLFluff passes on SQL in notebooks
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint Code (Python, Notebooks, SQL)
+    needs: [validate_pr]
+    runs-on:
+      - ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install lint dependencies
+        run: pip install pylint nbqa sqlfluff
+
+      - name: Run Pylint on notebooks
+        working-directory: workday
+        run: |
+          nbqa pylint src/ \
+          --output-format=github \
+          --ignored-modules=dbutils,spark,pyspark,pyspark.sql,pyspark.sql.window \
+          --additional-builtins=dbutils,spark \
+          --disable=invalid-name \
+          --const-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --variable-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --argument-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --fail-under=9.0
+
+      - name: Run SQLFluff (SQL in notebooks)
+        working-directory: workday
+        run: sqlfluff lint src/
+
+  # -------------------------------------------------------------------------
+  # 3. Secret scan — Bandit SAST, grep for hardcoded credentials, pip-audit
+  # Acceptance criteria: No hardcoded credentials in code or notebooks; pip-audit passes on exported prod dependencies; Bandit report uploaded
+  # -------------------------------------------------------------------------
+  secret_scan:
+    name: Secret & Security Scan
+    needs: [lint]
+    runs-on:
+      - ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install security tools
+        run: pip install bandit[toml] pip-audit uv
+
+      - name: Run Bandit (SAST)
+        working-directory: workday
+        run: |
+          bandit -r src/ -f json -o bandit-report.json || true
+          bandit -r src/ -f screen -ll # fail on MEDIUM+ severity
+
+      - name: Scan notebooks for hardcoded credentials
+        run: |
+          echo "Scanning notebooks and Python files for hardcoded credentials..."
+
+          # Patterns: bare tokens, password=, api_key=, secret=, client_secret=
+          FOUND=$(grep -rn \
+          -E "(DATABRICKS_TOKEN)\s*[:=]\s*['\"]?[a-zA-Z0-9]{20,}|password\s*[:=]\s*['\"]?[^'\" ]{8,}|client_secret\s*[:=]\s*['\"]?[^'\" ]{8,}|api[-_]?key\s*[:=]\s*['\"]?[^'\" ]{8,}|secret\s*[:=]\s*['\"]?[^'\" ]{8,}" \
+          workday/src/ workday/tests/ \
+          --include="*.py" --include="*.ipynb" || true)
+
+          if [ -n "$FOUND" ]; then
+            echo "❌ Potential hardcoded credential detected:"
+            echo "$FOUND"
+            echo ""
+            echo "Use Databricks Secrets (dbutils.secrets.get) or environment variables instead."
+            exit 1
+          fi
+          echo "✅ No hardcoded credentials found."
+
+      - name: Check for vulnerable dependencies
+        working-directory: workday
+        run: |
+          uv export --group prod --no-hashes > /tmp/requirements-audit.txt
+          pip-audit -r /tmp/requirements-audit.txt --desc
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report-workday
+          path: workday/bandit-report.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # 4. Unit tests — bronze and silver notebooks on Databricks (unit_dev)
+  # Acceptance criteria: Databricks job runs for bronze and silver unit tests complete successfully
+  # -------------------------------------------------------------------------
+  unit_test:
+    name: Unit Tests on Databricks (unit_dev)
+    needs: secret_scan
+    runs-on:
+      - ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Install Databricks CLI
+          run: |
+            curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+            databricks --version
+
+        - name: Import Unit Test Notebooks to Databricks Workspace
+          env:
+            DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+            DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+            DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+          run: |
+            databricks workspace import --overwrite --file workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb
+            databricks workspace import --overwrite --file workday/tests/unit/notebooks/silver/silver_workday_test.ipynb --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/silver/silver_workday_test.ipynb
+            databricks workspace import --overwrite --file workday/tests/config/dev/dev_test_config.json --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/config/dev/dev_test_config.json
+
+        - name: Generate bronze test run JSON with cluster ID and env
+          env:
+            DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
+            DATABRICKS_ENV: "dev"
+          run: |
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env=env.DATABRICKS_ENV' workday/tests/unit/notebooks/bronze/bronze_workday_test_run.json > workday/tests/unit/notebooks/bronze/bronze_workday_test_run_resolved.json
+
+        - name: Run Bronze Unit Test Notebook on Databricks
+          env:
+            DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+            DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+            DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}          
+          run: |
+            databricks jobs submit --json @workday/tests/unit/notebooks/bronze/bronze_workday_test_run_resolved.json
+
+        - name: Generate silver test run JSON with cluster ID and env
+          env:
+            DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
+            DATABRICKS_ENV: "dev"
+          run: |
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env=env.DATABRICKS_ENV' workday/tests/unit/notebooks/silver/silver_workday_test_run.json > workday/tests/unit/notebooks/silver/silver_workday_test_run_resolved.json
+
+        - name: Run Silver Unit Test Notebook on Databricks
+          env:
+            DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+            DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+            DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+          run: |
+            databricks jobs submit --json @workday/tests/unit/notebooks/silver/silver_workday_test_run_resolved.json
+
+        - name: Upload coverage report
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: coverage-report-dev
+            path: workday/coverage.xml
+            if-no-files-found: ignore
+
+      - name: Send SNS notification
+        if: always()
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.DEV_SNS_TOPIC_ARN }}
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            SUBJECT="✅ Unit tests succeeded 🟢 Dev (unit_dev)"
+          else
+            SUBJECT="❌ Unit tests failed 🔴 Dev (unit_dev)"
+          fi
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "$SUBJECT" \
+            --message "Workflow: ${{ github.workflow }}
+          Status: ${{ job.status }}
+          Target: ${{ env.DATABRICKS_TARGET }}
+          Commit: ${{ github.sha }}
+          Actor: ${{ github.actor }}
+          View run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || echo "Failed to send SNS notification"
+
+  # -------------------------------------------------------------------------
+  # 5. DAB validate (unit_dev) — validate only, no bundle deploy
+  # Acceptance criteria: databricks bundle validate succeeds for the unit_dev target
+  # -------------------------------------------------------------------------
+  bundle_validate:
+    name: Validate DAB Bundle (unit_dev)
+    needs: [unit_test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+      - name: Validate bundle
+        working-directory: workday
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+        run: databricks bundle validate --target ${{ env.DATABRICKS_TARGET }}
+
+  # -------------------------------------------------------------------------
+  # 6. Smoke tests — after bundle validate (no deploy in dev)
+  # Acceptance criteria: Smoke job JSON run succeeds against unit_dev; on failure, repo reset to base and bundle validate re-run (no deploy)
+  # -------------------------------------------------------------------------
+  smoke_test:
+    name: Smoke tests after DAB validate (unit_dev)
+    needs: [bundle_validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Run smoke tests
+        id: smoke
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
+        run: |
+          if [ -f workday/tests/smoke/smoke_test_run.json ]; then
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="dev"' workday/tests/smoke/smoke_test_run.json > /tmp/smoke-dev.json
+            databricks jobs submit --json @/tmp/smoke-dev.json
+          else
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="dev"' workday/tests/unit/notebooks/silver/silver_workday_test_run.json > /tmp/smoke-fallback.json
+            databricks jobs submit --json @/tmp/smoke-fallback.json
+          fi
+      - name: Re-validate bundle from base branch on smoke failure (no deploy)
+        if: failure()
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+        run: |
+          echo "Smoke failed — resetting ref to origin/${{ github.base_ref }} and re-running bundle validate only"
+          git fetch origin "${{ github.base_ref }}"
+          git reset --hard "origin/${{ github.base_ref }}"
+          cd workday && databricks bundle validate --target ${{ env.DATABRICKS_TARGET }}
+          exit 1
+
+  # -------------------------------------------------------------------------
+  # 7. CI gate — aggregate enforcement before merge
+  # Acceptance criteria: validate_pr, lint, secret_scan, unit_test, bundle_validate, and smoke_test all succeeded
+  # -------------------------------------------------------------------------
+  ci_gate:
+    name: CI Gate (all checks passed)
+    runs-on: ubuntu-latest
+    needs: [validate_pr, lint, secret_scan, unit_test, bundle_validate, smoke_test]
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - name: Evaluate results
+        run: |
+          VALIDATE_PR="${{ needs.validate_pr.result }}"
+          LINT="${{ needs.lint.result }}"
+          SCAN="${{ needs.secret_scan.result }}"
+          TESTS="${{ needs.unit_test.result }}"
+          BUNDLE="${{ needs.bundle_validate.result }}"
+          SMOKE="${{ needs.smoke_test.result }}"
+          echo "| validate_pr | $VALIDATE_PR |"
+          echo "| lint | $LINT |"
+          echo "| secret_scan | $SCAN |"
+          echo "| unit_test | $TESTS |"
+          echo "| bundle_validate | $BUNDLE |"
+          echo "| smoke_test | $SMOKE |"
+          if [[ "$VALIDATE_PR" != "success" || "$LINT" != "success" || "$SCAN" != "success" || \
+                "$TESTS" != "success" || "$BUNDLE" != "success" || "$SMOKE" != "success" ]]; then
+            echo "❌ CI Gate failed — merge blocked."
+            exit 1
+          fi
+          echo "✅ All CI checks passed. This PR is ready for review and merge."
+
+      - name: Write CI summary
+        if: always()
+        run: |
+          echo "### CI Results for PR #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "| validate_pr | ${{ needs.validate_pr.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| secret_scan | ${{ needs.secret_scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| unit_test | ${{ needs.unit_test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| bundle_validate | ${{ needs.bundle_validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| smoke_test | ${{ needs.smoke_test.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Send SNS notification
+        if: always()
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.DEV_SNS_TOPIC_ARN }}
+        run: |
+          if [[ "${{ needs.smoke_test.result }}" == "success" && "${{ needs.bundle_validate.result }}" == "success" ]]; then
+            SUBJECT="✅ CI Passed 🟢 Dev (PR #${{ github.event.pull_request.number }})"
+          else
+            SUBJECT="❌ CI Failed 🔴 Dev (PR #${{ github.event.pull_request.number }})"
+          fi
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "$SUBJECT" \
+            --message "Workflow: ${{ github.workflow }}
+          validate_pr: ${{ needs.validate_pr.result }}
+          lint: ${{ needs.lint.result }}
+          secret_scan: ${{ needs.secret_scan.result }}
+          unit_test: ${{ needs.unit_test.result }}
+          bundle_validate: ${{ needs.bundle_validate.result }}
+          smoke_test: ${{ needs.smoke_test.result }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || echo "Failed to send SNS"
+
+      - name: Generate App Token
+        id: generate_token
+        if: success()
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: databricks
+
+      - name: Comment on PR (passed)
+        if: success()
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body "✅ CI gate passed (unit_dev: DAB validate + smoke only; no DAB deploy). **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Auto-merge PR after successful CI
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          BASE_DELAY=5
+          for attempt in $(seq 1 5); do
+            echo "Attempt $attempt/5..."
+            MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" --auto --squash 2>&1) || true
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ PR auto-merge initiated."
+              exit 0
+            fi
+            if echo "$MERGE_OUTPUT" | grep -qiE "already merged|pull request.*closed|auto-merge.*already enabled"; then
+              exit 0
+            fi
+            [ $attempt -lt 5 ] && sleep $((BASE_DELAY * (2 ** (attempt - 1)))))
+          done
+          exit 1

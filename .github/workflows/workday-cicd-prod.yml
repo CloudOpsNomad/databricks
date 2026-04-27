@@ -1,0 +1,586 @@
+name: Workday Deploy to Production
+
+# - pull_request → main (from `stage`): validate → quality → unit tests → bundle validate → DAB deploy (prod) → smoke.
+#   If smoke passes, CI merges the PR to `main`. If smoke fails, no merge — SNS/report and bundle rollback to origin/<base> (main head).
+# - push → main: post-merge CD — approval, deploy, smoke (may re-deploy same SHA), rollback, tag, notify.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'workday/**'
+      - '.github/workflows/workday-cicd-prod.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'workday/**'
+      - '.github/workflows/workday-cicd-prod.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: '3.10'
+  DATABRICKS_TARGET: prod
+
+# One prod pipeline at a time on main (avoids overlapping DAB deploys from multiple PRs).
+concurrency:
+  group: workday-prod-main
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Validate PR — release path into main (stage or hotfix)
+  # Acceptance criteria: PR to main is from branch stage or hotfix/NDP-*; title matches release/NDP-*-YYYY-MM-DD or hotfix title pattern
+  # -------------------------------------------------------------------------
+  validate_pr:
+    name: Validate PR Rules (main)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR source branch (must be stage or hotfix)
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+          TARGET_BRANCH: ${{ github.base_ref }}
+        run: |
+          echo "--------------------------------------------------------"
+          echo "Validating PR source branch"
+          echo "  Source: $SOURCE_BRANCH  Target: $TARGET_BRANCH"
+          echo "--------------------------------------------------------"
+          echo "Rule: PRs to 'main' must come from 'stage' OR 'hotfix/NDP-*' (hotfix process: land on stage first per team policy — not enforced in this script)."
+          if [ "$TARGET_BRANCH" != "main" ]; then
+            echo "Not targeting main; skipping."
+            exit 0
+          fi
+          if [[ "$SOURCE_BRANCH" == "stage" ]]; then
+            echo "OK: release PR from stage."
+          elif [[ "$SOURCE_BRANCH" =~ ^hotfix/NDP-[0-9]+(-[a-zA-Z0-9_-]+)?$ ]]; then
+            echo "OK: hotfix PR branch."
+          else
+            echo "ERROR: '$SOURCE_BRANCH' is not allowed into main (expected: stage or hotfix/NDP-*)"
+            exit 1
+          fi
+
+      - name: Validate PR title (release or hotfix)
+        if: github.base_ref == 'main'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Validating PR title: $PR_TITLE"
+          if [[ "${{ github.head_ref }}" =~ ^hotfix/NDP- ]]; then
+            [[ "$PR_TITLE" =~ ^hotfix/NDP-[0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "Hotfix title must match hotfix/NDP-<n>-<YYYY-MM-DD>"; exit 1; }
+          else
+            [[ "$PR_TITLE" =~ ^release/NDP-[0-9]+-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "Release title must match release/NDP-<n>-<YYYY-MM-DD>"; exit 1; }
+          fi
+          echo "PR title OK."
+
+      - name: Send SNS on PR validation failure
+        if: failure()
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.PROD_SNS_TOPIC_ARN }}
+        run: |
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "❌ Production PR validation failed (main)" \
+            --message "Workflow: ${{ github.workflow }}
+          PR: ${{ github.head_ref }} → ${{ github.base_ref }}
+          Actor: ${{ github.actor }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+
+  # -------------------------------------------------------------------------
+  # 2. Pre-deploy — capture Git baseline for audit and rollback
+  # Acceptance criteria: Rollback SHA is recorded (PR base tip on pull_request; merge parent on push/dispatch)
+  # -------------------------------------------------------------------------
+  pre_deploy:
+    name: Record pre-deploy Git state (audit / rollback)
+    runs-on: ubuntu-latest
+    outputs:
+      previous_sha: ${{ steps.parent.outputs.sha }}
+    steps:
+      - name: Checkout (push = merge commit; PR = merge ref)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Capture rollback baseline SHA
+        id: parent
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Tip of main before this PR would merge — used only for messaging on PR runs
+            SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            # After merge to main: first parent of merge commit = mainline before this release
+            SHA=$(git rev-parse HEAD^1 2>/dev/null || git rev-parse HEAD)
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Rollback / baseline SHA: $SHA"
+
+  # -------------------------------------------------------------------------
+  # 3. Lint — pylint (Python), nbqa (notebooks), sqlfluff (SQL)
+  # Acceptance criteria: Pylint score meets threshold; SQLFluff passes on SQL in notebooks
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint Code (Python, Notebooks, SQL)
+    needs: [pre_deploy, validate_pr]
+    if: always() && (needs.validate_pr.result == 'success' || needs.validate_pr.result == 'skipped')
+    runs-on:
+      - ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install lint dependencies
+        run: pip install pylint nbqa sqlfluff
+
+      - name: Run Pylint on notebooks
+        working-directory: workday
+        run: |
+          nbqa pylint src/ \
+          --output-format=github \
+          --ignored-modules=dbutils,spark,pyspark,pyspark.sql,pyspark.sql.window \
+          --additional-builtins=dbutils,spark \
+          --disable=invalid-name \
+          --const-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --variable-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --argument-rgx='[a-z_][a-z0-9_]{2,30}$' \
+          --fail-under=9.0
+
+      - name: Run SQLFluff (SQL in notebooks)
+        working-directory: workday
+        run: sqlfluff lint src/
+
+  # -------------------------------------------------------------------------
+  # 4. Secret scan — Bandit SAST, grep for hardcoded credentials, pip-audit
+  # Acceptance criteria: No hardcoded credentials in code or notebooks; pip-audit passes on exported prod dependencies; Bandit report uploaded
+  # -------------------------------------------------------------------------
+  secret_scan:
+    name: Secret & Security Scan
+    needs: [lint]
+    runs-on:
+      - ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install security tools
+        run: pip install bandit[toml] pip-audit uv
+
+      - name: Run Bandit (SAST)
+        working-directory: workday
+        run: |
+          bandit -r src/ -f json -o bandit-report.json || true
+          bandit -r src/ -f screen -ll # fail on MEDIUM+ severity
+
+      - name: Scan notebooks for hardcoded credentials
+        run: |
+          echo "Scanning notebooks and Python files for hardcoded credentials..."
+
+          # Patterns: bare tokens, password=, api_key=, secret=, client_secret=
+          FOUND=$(grep -rn \
+          -E "(DATABRICKS_TOKEN)\s*[:=]\s*['\"]?[a-zA-Z0-9]{20,}|password\s*[:=]\s*['\"]?[^'\" ]{8,}|client_secret\s*[:=]\s*['\"]?[^'\" ]{8,}|api[-_]?key\s*[:=]\s*['\"]?[^'\" ]{8,}|secret\s*[:=]\s*['\"]?[^'\" ]{8,}" \
+          workday/src/ workday/tests/ \
+          --include="*.py" --include="*.ipynb" || true)
+
+          if [ -n "$FOUND" ]; then
+            echo "❌ Potential hardcoded credential detected:"
+            echo "$FOUND"
+            echo ""
+            echo "Use Databricks Secrets (dbutils.secrets.get) or environment variables instead."
+            exit 1
+          fi
+          echo "✅ No hardcoded credentials found."
+
+      - name: Check for vulnerable dependencies
+        working-directory: workday
+        run: |
+          uv export --group prod --no-hashes > /tmp/requirements-audit.txt
+          pip-audit -r /tmp/requirements-audit.txt --desc
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report-workday
+          path: workday/bandit-report.json
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # 5. Unit tests — bronze and silver notebooks on Databricks (prod credentials)
+  # Acceptance criteria: Databricks job runs for bronze and silver unit tests complete successfully
+  # -------------------------------------------------------------------------
+  unit_test:
+    name: Pre-prod unit tests (Databricks)
+    needs: [secret_scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+      - name: Import unit test notebooks
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+        run: |
+          databricks workspace import --overwrite --file workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb \
+            --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb
+          databricks workspace import --overwrite --file workday/tests/unit/notebooks/silver/silver_workday_test.ipynb \
+            --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/silver/silver_workday_test.ipynb
+      - name: Generate and run bronze test
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_PROD }}
+          DATABRICKS_ENV: "prod"
+        run: |
+          jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env=env.DATABRICKS_ENV' \
+            workday/tests/unit/notebooks/bronze/bronze_workday_test_run.json > workday/tests/unit/notebooks/bronze/bronze_workday_test_run_resolved.json
+          databricks jobs submit --json @workday/tests/unit/notebooks/bronze/bronze_workday_test_run_resolved.json
+      - name: Generate and run silver test
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_PROD }}
+          DATABRICKS_ENV: "prod"
+        run: |
+          jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env=env.DATABRICKS_ENV' \
+            workday/tests/unit/notebooks/silver/silver_workday_test_run.json > workday/tests/unit/notebooks/silver/silver_workday_test_run_resolved.json
+          databricks jobs submit --json @workday/tests/unit/notebooks/silver/silver_workday_test_run_resolved.json
+
+  # -------------------------------------------------------------------------
+  # 6. DAB validate — prod target (PR and push)
+  # Acceptance criteria: databricks bundle validate succeeds for the prod target before deploy or merge approval
+  # -------------------------------------------------------------------------
+  validate_bundle:
+    name: Validate DAB Bundle (prod)
+    needs: [lint, secret_scan, unit_test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+      - name: Validate bundle
+        working-directory: workday
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+        run: databricks bundle validate --target ${{ env.DATABRICKS_TARGET }}
+
+  # -------------------------------------------------------------------------
+  # 7. Production approval — protected environment (post-merge only)
+  # Acceptance criteria: Required reviewer/environment approval recorded before deploy
+  # -------------------------------------------------------------------------
+  approval:
+    name: Production approval (lead engineer)
+    if: github.event_name != 'pull_request'
+    needs: [validate_bundle, pre_deploy]
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+    steps:
+      - name: Log approval gate
+        run: |
+          echo "### Production deployment approved" >> $GITHUB_STEP_SUMMARY
+          echo "Baseline SHA for rollback: \`${{ needs.pre_deploy.outputs.previous_sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # -------------------------------------------------------------------------
+  # 8. DAB deploy — prod target (PR pre-merge gate and post-merge push)
+  # Acceptance criteria: databricks bundle deploy succeeds for the prod target (approval skipped on PR; required on push)
+  # -------------------------------------------------------------------------
+  deploy_bundle:
+    name: Deploy DAB (prod)
+    needs: [validate_bundle, pre_deploy, approval]
+    if: always() && needs.validate_bundle.result == 'success' && needs.pre_deploy.result == 'success' && (needs.approval.result == 'success' || needs.approval.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.DATABRICKS_HOST_PROD }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+      - name: Deploy bundle
+        working-directory: workday
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+        run: databricks bundle deploy --target ${{ env.DATABRICKS_TARGET }}
+
+  # -------------------------------------------------------------------------
+  # 9. Smoke tests — after DAB deploy to prod
+  # Acceptance criteria: Post-deploy smoke job succeeds; on failure redeploy bundle from origin/<base> on PR or baseline SHA on push, then fail job
+  # -------------------------------------------------------------------------
+  smoke_test:
+    name: Smoke tests after DAB deploy (prod)
+    needs: [deploy_bundle, pre_deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Run smoke tests
+        id: smoke
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_PROD }}
+        run: |
+          if [ -f workday/tests/smoke/smoke_test_run.json ]; then
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="prod"' workday/tests/smoke/smoke_test_run.json > /tmp/smoke-prod.json
+            databricks jobs submit --json @/tmp/smoke-prod.json
+          else
+            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="prod"' workday/tests/unit/notebooks/silver/silver_workday_test_run.json > /tmp/smoke-fallback.json
+            databricks jobs submit --json @/tmp/smoke-fallback.json
+          fi
+      - name: Notify PR smoke success
+        if: success() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.PROD_SNS_TOPIC_ARN }}
+        run: |
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "✅ Production PR smoke passed (pre-merge) — PR #${{ github.event.pull_request.number }}" \
+            --message "Deploy + smoke succeeded. Workflow will merge to main if gate passes. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+      - name: Rollback — redeploy bundle from target branch head or baseline SHA
+        if: failure()
+        env:
+          PREVIOUS_SHA: ${{ needs.pre_deploy.outputs.previous_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          SNS_TOPIC_ARN: ${{ secrets.PROD_SNS_TOPIC_ARN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_PROD }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "Smoke failed on PR — redeploying DAB from origin/${BASE_REF} (target branch head); PR will NOT be merged."
+            git fetch origin "$BASE_REF"
+            git reset --hard "origin/${BASE_REF}"
+          else
+            echo "Smoke failed post-merge — redeploying DAB from baseline SHA $PREVIOUS_SHA"
+            git fetch origin main
+            git checkout "$PREVIOUS_SHA"
+          fi
+          cd workday && databricks bundle deploy --target ${{ env.DATABRICKS_TARGET }}
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            aws sns publish \
+              --topic-arn "$SNS_TOPIC_ARN" \
+              --subject "❌ Production PR smoke failed — PR #${PR_NUMBER} not merged; bundle rolled back to origin/${BASE_REF}" \
+              --message "Smoke failed after prod DAB deploy. Rollback to origin/${BASE_REF} was attempted. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+          else
+            aws sns publish \
+              --topic-arn "$SNS_TOPIC_ARN" \
+              --subject "❌ Production smoke failed (post-merge); rollback attempted" \
+              --message "Smoke failed. Rollback SHA $PREVIOUS_SHA attempted. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+          fi
+          exit 1
+
+  # -------------------------------------------------------------------------
+  # 10. Tag release — annotated deploy tag for audit trail (post-merge only)
+  # Acceptance criteria: Git annotated tag is created and pushed for the release commit after successful smoke
+  # -------------------------------------------------------------------------
+  tag_release:
+    name: Tag deployment (auditability)
+    if: github.event_name != 'pull_request' && needs.smoke_test.result == 'success'
+    needs: [smoke_test, pre_deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Create annotated tag
+        run: |
+          TAG="deploy/prod-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}"
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag -a "$TAG" -m "Production deploy $TAG commit ${{ github.sha }}"
+          git push origin "$TAG"
+
+  # -------------------------------------------------------------------------
+  # 11. Notify — PR comment and SNS (post-merge only)
+  # Acceptance criteria: Team receives SNS (and merged PR comment when applicable) with deploy/smoke outcome
+  # -------------------------------------------------------------------------
+  notify:
+    name: Notify team
+    if: always() && github.event_name != 'pull_request'
+    needs: [deploy_bundle, smoke_test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: databricks
+      - name: Comment on merged PR
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER=$(gh pr list --search "${{ github.sha }}" --state merged --base main --json number --jq '.[0].number // empty' --repo "${{ github.repository }}")
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No merged PR found for this SHA; skipping comment."
+            exit 0
+          fi
+          if [ "${{ needs.smoke_test.result }}" == "success" ]; then
+            BODY="✅ Production DAB deploy and smoke tests passed. Tag created for audit. **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            BODY="❌ Production smoke failed; bundle rollback to ${{ needs.pre_deploy.outputs.previous_sha }} was attempted. **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$BODY"
+      - name: Send SNS
+        continue-on-error: true
+        env:
+          SNS_TOPIC_ARN: ${{ secrets.PROD_SNS_TOPIC_ARN }}
+        run: |
+          if [ "${{ needs.smoke_test.result }}" == "success" ]; then
+            SUBJECT="✅ Production deploy succeeded"
+          else
+            SUBJECT="❌ Production deploy / smoke failed (rollback attempted)"
+          fi
+          aws sns publish \
+            --topic-arn "$SNS_TOPIC_ARN" \
+            --subject "$SUBJECT" \
+            --message "Workflow ${{ github.workflow }} smoke_test=${{ needs.smoke_test.result }} deploy_bundle=${{ needs.deploy_bundle.result }} run=${{ github.run_id }}"
+
+  # -------------------------------------------------------------------------
+  # 12. CI gate — PR (pre-merge deploy + smoke) vs push (post-merge CD)
+  # Acceptance criteria: On pull_request, full pre-merge gate including deploy + smoke; on push/dispatch, approval + deploy + smoke + tag
+  # -------------------------------------------------------------------------
+  ci_gate:
+    name: CI Gate (production pipeline)
+    needs: [pre_deploy, validate_pr, lint, secret_scan, unit_test, validate_bundle, approval, deploy_bundle, smoke_test, tag_release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce PR vs push rules
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "pre_deploy=${{ needs.pre_deploy.result }}"
+          echo "validate_pr=${{ needs.validate_pr.result }}"
+          echo "lint=${{ needs.lint.result }}"
+          echo "secret_scan=${{ needs.secret_scan.result }}"
+          echo "unit_test=${{ needs.unit_test.result }}"
+          echo "validate_bundle=${{ needs.validate_bundle.result }}"
+          echo "approval=${{ needs.approval.result }}"
+          echo "deploy_bundle=${{ needs.deploy_bundle.result }}"
+          echo "smoke_test=${{ needs.smoke_test.result }}"
+          echo "tag_release=${{ needs.tag_release.result }}"
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "--- PR gate (stage → main): validate → quality → deploy prod → smoke → merge (this job must pass before merge job) ---"
+            [[ "${{ needs.validate_pr.result }}" == "success" ]] || { echo "❌ PR rules failed"; exit 1; }
+            [[ "${{ needs.lint.result }}" == "success" ]] || { echo "❌ Lint failed"; exit 1; }
+            [[ "${{ needs.secret_scan.result }}" == "success" ]] || { echo "❌ Secret scan failed"; exit 1; }
+            [[ "${{ needs.unit_test.result }}" == "success" ]] || { echo "❌ Unit tests failed"; exit 1; }
+            [[ "${{ needs.validate_bundle.result }}" == "success" ]] || { echo "❌ Bundle validate failed"; exit 1; }
+            [[ "${{ needs.approval.result }}" == "success" || "${{ needs.approval.result }}" == "skipped" ]] || { echo "❌ Approval gate failed"; exit 1; }
+            [[ "${{ needs.deploy_bundle.result }}" == "success" ]] || { echo "❌ DAB deploy failed — PR will not be merged"; exit 1; }
+            [[ "${{ needs.smoke_test.result }}" == "success" ]] || { echo "❌ Smoke failed — PR will not be merged (rollback attempted)"; exit 1; }
+            [[ "${{ needs.tag_release.result }}" == "success" || "${{ needs.tag_release.result }}" == "skipped" ]] || { echo "❌ Unexpected tag_release state"; exit 1; }
+            echo "✅ PR pre-merge gate passed — merge to main will be attempted by automation."
+            exit 0
+          fi
+
+          echo "--- Push gate (post-merge CD) ---"
+          [[ "${{ needs.pre_deploy.result }}" == "success" ]] || { echo "❌ pre_deploy failed"; exit 1; }
+          [[ "${{ needs.lint.result }}" == "success" ]] || { echo "❌ Lint failed"; exit 1; }
+          [[ "${{ needs.secret_scan.result }}" == "success" ]] || { echo "❌ Secret scan failed"; exit 1; }
+          [[ "${{ needs.unit_test.result }}" == "success" ]] || { echo "❌ Unit tests failed"; exit 1; }
+          [[ "${{ needs.validate_bundle.result }}" == "success" ]] || { echo "❌ Bundle validate failed"; exit 1; }
+          [[ "${{ needs.approval.result }}" == "success" ]] || { echo "❌ Approval gate failed"; exit 1; }
+          [[ "${{ needs.deploy_bundle.result }}" == "success" ]] || { echo "❌ Deploy failed"; exit 1; }
+          [[ "${{ needs.smoke_test.result }}" == "success" ]] || { echo "❌ Smoke failed (rollback attempted)"; exit 1; }
+          [[ "${{ needs.tag_release.result }}" == "success" ]] || { echo "❌ Audit tag failed"; exit 1; }
+          echo "✅ Production CD pipeline completed successfully."
+
+  # -------------------------------------------------------------------------
+  # 13. Merge release PR — only after green pre-merge gate (smoke passed)
+  # Acceptance criteria: PR to main is merged via GitHub App; humans should not merge before this job (use branch rules + no bypass)
+  # -------------------------------------------------------------------------
+  merge_release_pr:
+    name: Merge release PR to main
+    if: github.event_name == 'pull_request' && needs.ci_gate.result == 'success'
+    needs: [ci_gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate App Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: databricks
+      - name: Merge PR (after deploy + smoke)
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          echo "Merging PR #${PR_NUMBER} to main (release path)..."
+          for attempt in $(seq 1 5); do
+            if gh pr merge "$PR_NUMBER" --repo "${{ github.repository }}" --merge; then
+              echo "✅ PR merged to main."
+              exit 0
+            fi
+            echo "Merge attempt $attempt failed; retrying in 15s..."
+            sleep 15
+          done
+          echo "❌ gh pr merge failed after retries — merge manually or fix branch protection / app permissions."
+          exit 1
+      - name: Comment on PR if merge failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" \
+            --body "❌ Automated merge to \`main\` failed after smoke passed. Check workflow logs and merge manually if appropriate. **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
