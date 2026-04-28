@@ -292,9 +292,12 @@ jobs:
             DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
             DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
           run: |
-            databricks workspace import --overwrite --file workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb
-            databricks workspace import --overwrite --file workday/tests/unit/notebooks/silver/silver_workday_test.ipynb --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/silver/silver_workday_test.ipynb
-            databricks workspace import --overwrite --file workday/tests/config/dev/dev_test_config.json --format JUPYTER /Workspace/Users/user@databricks.com/workday/tests/config/dev/dev_test_config.json
+            databricks workspace mkdirs /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/bronze
+            databricks workspace mkdirs /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/silver
+            databricks workspace mkdirs /Workspace/Users/user@databricks.com/workday/tests/config/dev
+            databricks workspace import --overwrite --file workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb --format AUTO /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/bronze/bronze_workday_test.ipynb
+            databricks workspace import --overwrite --file workday/tests/unit/notebooks/silver/silver_workday_test.ipynb --format AUTO /Workspace/Users/user@databricks.com/workday/tests/unit/notebooks/silver/silver_workday_test.ipynb
+            databricks workspace import --overwrite --file workday/tests/config/dev/dev_test_config.json --format AUTO /Workspace/Users/user@databricks.com/workday/tests/config/dev/dev_test_config.json
 
         - name: Generate bronze test run JSON with cluster ID and env
           env:
@@ -401,15 +404,8 @@ jobs:
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST_DEV }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
           DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
-          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
-        run: |
-          if [ -f workday/tests/smoke/smoke_test_run.json ]; then
-            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="dev"' workday/tests/smoke/smoke_test_run.json > /tmp/smoke-dev.json
-            databricks jobs submit --json @/tmp/smoke-dev.json
-          else
-            jq '.tasks[0].existing_cluster_id=env.DATABRICKS_CLUSTER_ID | .tasks[0].notebook_task.base_parameters.env="dev"' workday/tests/unit/notebooks/silver/silver_workday_test_run.json > /tmp/smoke-fallback.json
-            databricks jobs submit --json @/tmp/smoke-fallback.json
-          fi
+        working-directory: workday
+        run: databricks bundle run workday_smoke_test --target ${{ env.DATABRICKS_TARGET }}
       - name: Re-validate bundle from base branch on smoke failure (no deploy)
         if: failure()
         env:
